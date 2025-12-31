@@ -635,6 +635,7 @@ class LocalSendDiscovery {
     const discovered = [];
     const total = tasks.length;
     let completed = 0;
+    let lastProgress = -1;
 
     for (let i = 0; i < tasks.length; i += concurrency) {
       const batch = tasks.slice(i, i + concurrency);
@@ -649,13 +650,14 @@ class LocalSendDiscovery {
         }
       }
 
-      // 显示进度（每批完成后）
+      // 显示进度（每批完成后，避免过于频繁刷新）
       const progress = Math.round((completed / total) * 100);
-      process.stdout.write(`\r[SCAN] ${interfaceName}: ${progress}% (${completed}/${total})`);
+      // 只在进度变化超过 10% 时显示，避免刷屏
+      if (progress - lastProgress >= 20 || completed === total) {
+        console.log(`[SCAN PROGRESS] ${interfaceName}: ${progress}% (${completed}/${total})`);
+        lastProgress = progress;
+      }
     }
-
-    // 换行，避免覆盖
-    console.log('');
 
     return discovered;
   }
@@ -811,10 +813,10 @@ class LocalSendDiscovery {
       // 等待 UDP 响应
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // 如果 10 秒后仍未发现设备，自动触发 HTTP 扫描（仅一次）
-      if (refreshCount >= 3 && discoveredDevices.size === 0 && !hasScanned) {
+      // 优化：如果 6 秒后仍未发现设备，自动触发 HTTP 扫描（更快）
+      if (refreshCount >= 2 && discoveredDevices.size === 0 && !hasScanned) {
         hasScanned = true;
-        console.log('\n[AUTO] No devices found via multicast, starting HTTP scan...\n');
+        console.log('\n[AUTO] No devices found via multicast (6s), starting HTTP scan...\n');
         await this.scanSubnet();
       }
 
