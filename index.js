@@ -36,7 +36,9 @@ class LocalSendDiscovery {
 
   // 加载配置文件（不存在则自动创建默认配置）
   loadConfig() {
-    const configPath = path.join(__dirname, 'config.json');
+    // 使用 process.cwd() 而不是 __dirname，以支持 pkg 打包后的 exe
+    // pkg 打包后，__dirname 指向虚拟文件系统，process.cwd() 指向实际运行目录
+    const configPath = path.join(process.cwd(), 'config.json');
 
     try {
       // 检查配置文件是否存在
