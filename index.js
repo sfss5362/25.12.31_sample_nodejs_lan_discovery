@@ -34,20 +34,46 @@ class LocalSendDiscovery {
     this.config = this.loadConfig();  // 加载配置文件
   }
 
-  // 加载配置文件
+  // 加载配置文件（不存在则自动创建默认配置）
   loadConfig() {
+    const configPath = path.join(__dirname, 'config.json');
+
     try {
-      const configPath = path.join(__dirname, 'config.json');
+      // 检查配置文件是否存在
       if (fs.existsSync(configPath)) {
+        // 用户已准备配置文件，优先使用用户的
         const configData = fs.readFileSync(configPath, 'utf8');
         const config = JSON.parse(configData);
-        console.log(`Loaded config: ${config.additionalSubnets?.length || 0} additional subnet(s)`);
+        console.log(`Loaded user config: ${config.additionalSubnets?.length || 0} additional subnet(s)`);
         return config;
+      } else {
+        // 配置文件不存在，自动创建默认配置
+        const defaultConfig = {
+          additionalSubnets: [
+            "192.168.1",
+            "192.168.11"
+          ]
+        };
+
+        try {
+          fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
+          console.log('Created default config.json (192.168.1, 192.168.11)');
+        } catch (writeErr) {
+          console.warn('Failed to create default config.json:', writeErr.message);
+        }
+
+        return defaultConfig;
       }
     } catch (err) {
       console.warn('Failed to load config.json:', err.message);
+      // 返回默认配置
+      return {
+        additionalSubnets: [
+          "192.168.1",
+          "192.168.11"
+        ]
+      };
     }
-    return { additionalSubnets: [] };
   }
 
   // 计算网络接口优先级（参考 LocalSend）
