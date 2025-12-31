@@ -131,7 +131,7 @@ class LocalSendDiscovery {
   }
 
   // 注册设备
-  registerDevice(deviceInfo, ip) {
+  registerDevice(deviceInfo, ip, discoveryMethod = 'multicast') {
     // 过滤掉自己
     if (deviceInfo.fingerprint === DEVICE_FINGERPRINT) {
       return;
@@ -142,15 +142,18 @@ class LocalSendDiscovery {
 
     const deviceKey = deviceInfo.fingerprint;
     const isNew = !discoveredDevices.has(deviceKey);
+    const existing = discoveredDevices.get(deviceKey);
 
     discoveredDevices.set(deviceKey, {
       ...deviceInfo,
       ip: cleanIP,
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      discoveryMethod: existing?.discoveryMethod || discoveryMethod  // 保留首次发现方式
     });
 
     if (isNew) {
-      console.log(`\n[NEW DEVICE] ${deviceInfo.alias} (${cleanIP})`);
+      const methodLabel = discoveryMethod === 'http-scan' ? 'HTTP扫描' : '多播发现';
+      console.log(`\n[NEW DEVICE] ${deviceInfo.alias} (${cleanIP}) - ${methodLabel}`);
       console.log(`  Type: ${deviceInfo.deviceType}, Model: ${deviceInfo.deviceModel}`);
       this.showDeviceList();
     }
@@ -205,6 +208,11 @@ class LocalSendDiscovery {
         return;
       }
 
+      // 过滤自己 - 不处理自己的消息
+      if (deviceInfo.fingerprint === DEVICE_FINGERPRINT) {
+        return;
+      }
+
       // 注册设备
       this.registerDevice(deviceInfo, rinfo.address);
 
@@ -229,11 +237,11 @@ class LocalSendDiscovery {
     try {
       // 优先：通过 HTTP/TCP 响应
       await this.respondViaHTTP(peer);
-      console.log(`[HTTP RESPOND] ${peer.alias} (${peer.ip})`);
+      // 静默响应，不显示日志
     } catch (err) {
       // Fallback：HTTP 失败，改用 UDP 响应
       this.respondViaUDP(peer);
-      console.log(`[UDP RESPOND] ${peer.alias} (${peer.ip}) - HTTP failed`);
+      // 静默响应，不显示日志
     }
   }
 
@@ -378,8 +386,8 @@ class LocalSendDiscovery {
               return;
             }
 
-            // 注册设备
-            this.registerDevice(deviceInfo, ip);
+            // 注册设备（标记为 HTTP 扫描发现）
+            this.registerDevice(deviceInfo, ip, 'http-scan');
             resolve(deviceInfo);
 
           } catch (err) {
@@ -461,7 +469,8 @@ class LocalSendDiscovery {
       for (const device of discoveredDevices.values()) {
         const protocol = device.protocol || 'http';
         const url = `${protocol}://${device.ip}:${device.port}`;
-        console.log(`${index}. ${device.alias} (${device.deviceType})`);
+        const methodLabel = device.discoveryMethod === 'http-scan' ? '[HTTP扫描]' : '[多播发现]';
+        console.log(`${index}. ${device.alias} (${device.deviceType}) ${methodLabel}`);
         console.log(`   IP: ${device.ip} | URL: ${url}`);
         index++;
       }
@@ -482,16 +491,31 @@ class LocalSendDiscovery {
     this.stopAutoRefresh();
 
     console.log('\n>>> Auto-refresh mode started <<<');
-    console.log('Press Ctrl+C to stop and return to menu\n');
+    console.log('Press any key to stop and return to menu\n');
+
+    let refreshCount = 0;
+    let hasScanned = false;
 
     // 立即广播并显示一次
     this.announceViaUDP();
     setTimeout(() => this.showDeviceListOnce(), 500);
 
     // 每3秒自动刷新
-    this.autoRefreshTimer = setInterval(() => {
+    this.autoRefreshTimer = setInterval(async () => {
+      refreshCount++;
       this.announceViaUDP();
-      setTimeout(() => this.showDeviceListOnce(), 500);
+
+      // 等待 UDP 响应
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // 如果 10 秒后仍未发现设备，自动触发 HTTP 扫描（仅一次）
+      if (refreshCount >= 3 && discoveredDevices.size === 0 && !hasScanned) {
+        hasScanned = true;
+        console.log('\n[AUTO] No devices found via multicast, starting HTTP scan...\n');
+        await this.scanSubnet();
+      }
+
+      this.showDeviceListOnce();
     }, 3000);
   }
 
@@ -506,7 +530,7 @@ class LocalSendDiscovery {
 
   // 显示菜单
   showMenu() {
-    console.log('Commands: [l]ist (auto-refresh) | [s]can | [i]nfo | [q]uit');
+    console.log('Commands: list (auto-refresh + auto-scan) | info | quit');
     console.log('Tip: Press any key to stop auto-refresh');
     process.stdout.write('> ');
   }
@@ -576,13 +600,13 @@ async function main() {
         case 'list':
         case 'r':
         case 'refresh':
-          // 启动自动刷新模式
+          // 启动自动刷新模式（包含自动扫描）
           discovery.startAutoRefresh();
           break;
 
         case 's':
         case 'scan':
-          // HTTP 子网扫描
+          // 手动 HTTP 子网扫描（备用）
           discovery.stopAutoRefresh();
           await discovery.scanSubnet();
           discovery.showDeviceList();
