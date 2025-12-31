@@ -31,18 +31,74 @@ class LocalSendDiscovery {
     this.autoRefreshTimer = null;  // 自动刷新定时器
   }
 
-  // 获取所有本机 IP 地址
+  // 计算网络接口优先级（参考 LocalSend）
+  calculatePriority(ip, name) {
+    // APIPA 地址（169.254.x.x）- 自动分配IP，无实际网络
+    if (ip.startsWith('169.254.')) {
+      return -20;
+    }
+
+    // 虚拟网卡（WSL, Hyper-V, Docker, VirtualBox 等）
+    const virtualKeywords = ['WSL', 'Hyper-V', 'vEthernet', 'VirtualBox', 'VMware', 'Docker', 'vboxnet', 'vmnet'];
+    if (virtualKeywords.some(keyword => name.includes(keyword))) {
+      return -10;
+    }
+
+    // VPN（Tailscale 100.x.x.x, ZeroTier 等）
+    if (ip.startsWith('100.') || ip.startsWith('10.')) {
+      // 10.x.x.x 可能是内网，但 Tailscale 用 100.x
+      if (ip.startsWith('100.')) {
+        return -5;
+      }
+    }
+
+    // WiFi（最高优先级）- 通常是真实设备所在网络
+    const wifiKeywords = ['wlan', 'wi-fi', 'wifi', 'wireless', '无线'];
+    if (wifiKeywords.some(keyword => name.toLowerCase().includes(keyword))) {
+      return 100;
+    }
+
+    // 以太网（高优先级）- 排除虚拟以太网
+    const ethernetKeywords = ['ethernet', '以太网', 'eth'];
+    if (ethernetKeywords.some(keyword => name.toLowerCase().includes(keyword))) {
+      // 检查是否是"以太网 N"（N > 3），通常是虚拟网卡
+      const match = name.match(/以太网 (\d+)/);
+      if (match && parseInt(match[1]) > 3) {
+        return -5;  // 降低优先级
+      }
+      return 50;
+    }
+
+    // 网关地址 (.1) - 通常是路由器/网关接口，不是主要网络
+    if (ip.endsWith('.1')) {
+      return 1;
+    }
+
+    // 默认优先级
+    return 10;
+  }
+
+  // 获取所有本机 IP 地址（带优先级和过滤）
   getAllLocalIPs() {
     const ips = [];
     const interfaces = os.networkInterfaces();
     for (const name of Object.keys(interfaces)) {
       for (const iface of interfaces[name]) {
         if (iface.family === 'IPv4' && !iface.internal) {
-          ips.push({ name, address: iface.address });
+          const priority = this.calculatePriority(iface.address, name);
+          ips.push({
+            name,
+            address: iface.address,
+            priority: priority
+          });
         }
       }
     }
-    return ips.length > 0 ? ips : [{ name: 'localhost', address: '127.0.0.1' }];
+
+    // 按优先级降序排序（高优先级在前）
+    ips.sort((a, b) => b.priority - a.priority);
+
+    return ips.length > 0 ? ips : [{ name: 'localhost', address: '127.0.0.1', priority: 0 }];
   }
 
   // 获取本机 IP 地址（第一个）
@@ -362,7 +418,7 @@ class LocalSendDiscovery {
     }
   }
 
-  // HTTP 子网扫描（AP 隔离网络备用方案）
+  // HTTP 子网扫描（AP 隔离网络备用方案）- 多子网支持 + 智能过滤
   async scanSubnet() {
     const localIPs = this.getAllLocalIPs();
     if (localIPs.length === 0) {
@@ -370,13 +426,53 @@ class LocalSendDiscovery {
       return [];
     }
 
-    // 使用第一个非本地 IP 的子网
-    const myIP = localIPs[0].address;
-    const subnet = myIP.split('.').slice(0, 3).join('.');
+    // 过滤掉负优先级的接口（虚拟网卡、APIPA、VPN）
+    const validIPs = localIPs.filter(ip => ip.priority > 0);
 
-    console.log(`\n[SCAN] Starting subnet scan: ${subnet}.1-254`);
-    console.log('[SCAN] This may take 10-30 seconds...\n');
+    if (validIPs.length === 0) {
+      console.log('[SCAN] No valid network interface (all are virtual/APIPA/VPN)');
+      console.log('[SCAN] Skipped interfaces:');
+      localIPs.forEach(ip => {
+        console.log(`  - ${ip.name} (${ip.address}) [Priority: ${ip.priority}]`);
+      });
+      return [];
+    }
 
+    // 限制最多扫描 3 个接口（对齐 LocalSend）
+    const MAX_INTERFACES = 3;
+    const interfacesToScan = validIPs.slice(0, MAX_INTERFACES);
+
+    console.log(`\n[SCAN] Starting multi-subnet scan (${interfacesToScan.length} subnet${interfacesToScan.length > 1 ? 's' : ''})`);
+    console.log('[SCAN] Selected interfaces (by priority):');
+    interfacesToScan.forEach((iface, index) => {
+      console.log(`  ${index + 1}. ${iface.name} (${iface.address}) [Priority: ${iface.priority}]`);
+    });
+
+    if (validIPs.length > MAX_INTERFACES) {
+      console.log(`[SCAN] Skipped ${validIPs.length - MAX_INTERFACES} lower-priority interface(s)`);
+    }
+
+    console.log('[SCAN] This may take 10-30 seconds per subnet...\n');
+
+    // 并行扫描所有子网
+    const allPromises = interfacesToScan.map((iface, index) => {
+      const subnet = iface.address.split('.').slice(0, 3).join('.');
+      console.log(`[SCAN ${index + 1}/${interfacesToScan.length}] ${iface.name}: ${subnet}.1-254`);
+      return this.scanSingleSubnet(subnet, iface.address, iface.name);
+    });
+
+    // 等待所有扫描完成
+    const results = await Promise.all(allPromises);
+
+    // 合并所有结果
+    const allDevices = results.flat();
+
+    console.log(`\n[SCAN] Complete. Found ${allDevices.length} device(s) across ${interfacesToScan.length} subnet(s)\n`);
+    return allDevices;
+  }
+
+  // 扫描单个子网
+  async scanSingleSubnet(subnet, myIP, interfaceName) {
     const tasks = [];
     for (let i = 1; i <= 254; i++) {
       const ip = `${subnet}.${i}`;
@@ -397,12 +493,11 @@ class LocalSendDiscovery {
         if (result.status === 'fulfilled' && result.value) {
           discovered.push(result.value);
           const device = result.value;
-          console.log(`[SCAN FOUND] ${device.alias} (${device.ip})`);
+          console.log(`[SCAN FOUND] ${device.alias} (${device.ip}) on ${interfaceName}`);
         }
       }
     }
 
-    console.log(`\n[SCAN] Complete. Found ${discovered.length} device(s)\n`);
     return discovered;
   }
 
@@ -594,16 +689,27 @@ class LocalSendDiscovery {
     console.log(`Model: ${info.deviceModel}`);
     console.log(`Port: ${info.port}`);
 
-    // 显示所有本机 IP 地址
+    // 显示所有本机 IP 地址（按优先级排序）
     const ips = this.getAllLocalIPs();
-    console.log(`Local IPs (detected):`);
+    console.log(`\nLocal IPs (sorted by priority):`);
     ips.forEach((ip, index) => {
-      console.log(`  ${index + 1}. ${ip.address} (${ip.name})`);
+      const priorityLabel = ip.priority > 0 ? `✓ Priority: ${ip.priority}` : `✗ Priority: ${ip.priority} (filtered)`;
+      console.log(`  ${index + 1}. ${ip.address} (${ip.name}) - ${priorityLabel}`);
     });
 
-    console.log(`API: http://localhost:${this.httpPort}/api/localsend/v2/info`);
+    // 显示将被扫描的接口
+    const validIPs = ips.filter(ip => ip.priority > 0);
+    if (validIPs.length > 0) {
+      const scanIPs = validIPs.slice(0, 3);
+      console.log(`\nInterfaces to be scanned (top 3):`);
+      scanIPs.forEach((ip, index) => {
+        console.log(`  ${index + 1}. ${ip.name} (${ip.address})`);
+      });
+    }
+
+    console.log(`\nAPI: http://localhost:${this.httpPort}/api/localsend/v2/info`);
     console.log('');
-    console.log('Note: Peers discover your actual IP from UDP broadcast source address.');
+    console.log('Note: Virtual networks, APIPA, and VPN are filtered out from scanning.');
     console.log('-------------------\n');
     this.showMenu();
   }
