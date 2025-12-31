@@ -54,12 +54,13 @@ class LocalSendDiscovery {
           additionalSubnets: [
             "192.168.1",
             "192.168.11"
-          ]
+          ],
+          knownDevices: []  // 用户可手动添加常用设备 IP
         };
 
         try {
           fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
-          console.log('Created default config.json (192.168.1, 192.168.11)');
+          console.log('Created default config.json');
         } catch (writeErr) {
           console.warn('Failed to create default config.json:', writeErr.message);
         }
@@ -73,7 +74,8 @@ class LocalSendDiscovery {
         additionalSubnets: [
           "192.168.1",
           "192.168.11"
-        ]
+        ],
+        knownDevices: []
       };
     }
   }
@@ -508,8 +510,41 @@ class LocalSendDiscovery {
     return subnets;
   }
 
+  // 快速扫描已知设备（优先级高，秒级发现）
+  async scanKnownDevices() {
+    if (!this.config.knownDevices || this.config.knownDevices.length === 0) {
+      return [];
+    }
+
+    console.log(`\n[FAST SCAN] Scanning ${this.config.knownDevices.length} known device(s)...`);
+
+    const tasks = this.config.knownDevices.map(ip => this.tryDiscoverViaHTTP(ip));
+    const results = await Promise.allSettled(tasks);
+
+    const discovered = [];
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === 'fulfilled' && result.value) {
+        discovered.push(result.value);
+        const device = result.value;
+        console.log(`[FAST SCAN FOUND] ${device.alias} (${this.config.knownDevices[i]}) ⚡`);
+      }
+    }
+
+    if (discovered.length > 0) {
+      console.log(`[FAST SCAN] Found ${discovered.length} known device(s) in <1 second\n`);
+    } else {
+      console.log(`[FAST SCAN] No known devices found, continuing with full scan...\n`);
+    }
+
+    return discovered;
+  }
+
   // HTTP 子网扫描（AP 隔离网络备用方案）- 多子网支持 + 智能过滤 + 配置文件
   async scanSubnet() {
+    // 优先扫描已知设备（快速发现）
+    const knownDevicesFound = await this.scanKnownDevices();
+
     const allSubnets = this.getAllSubnetsToScan();
 
     if (allSubnets.length === 0) {
@@ -555,11 +590,34 @@ class LocalSendDiscovery {
     // 等待所有扫描完成
     const results = await Promise.all(allPromises);
 
-    // 合并所有结果
-    const allDevices = results.flat();
+    // 合并所有结果（已知设备 + 子网扫描）
+    const subnetDevices = results.flat();
+    const allDevices = [...knownDevicesFound, ...subnetDevices];
 
-    console.log(`\n[SCAN] Complete. Found ${allDevices.length} device(s) across ${subnetsToScan.length} subnet(s)\n`);
-    return allDevices;
+    // 去重（防止已知设备在子网扫描中重复发现）
+    const uniqueDevices = [];
+    const seenFingerprints = new Set();
+    for (const device of allDevices) {
+      if (!seenFingerprints.has(device.fingerprint)) {
+        seenFingerprints.add(device.fingerprint);
+        uniqueDevices.push(device);
+      }
+    }
+
+    const totalFound = uniqueDevices.length;
+    const knownFound = knownDevicesFound.length;
+    const subnetFound = totalFound - knownFound;
+
+    console.log(`\n[SCAN] Complete. Found ${totalFound} device(s) total`);
+    if (knownFound > 0) {
+      console.log(`  - Known devices: ${knownFound} (fast)`);
+    }
+    if (subnetFound > 0) {
+      console.log(`  - Subnet scan: ${subnetFound} (full scan)`);
+    }
+    console.log('');
+
+    return uniqueDevices;
   }
 
   // 扫描单个子网
@@ -572,22 +630,32 @@ class LocalSendDiscovery {
       }
     }
 
-    // 并发控制：每批 50 个
-    const concurrency = 50;
+    // 优化：并发控制从 50 提升到 100（加速扫描）
+    const concurrency = 100;
     const discovered = [];
+    const total = tasks.length;
+    let completed = 0;
 
     for (let i = 0; i < tasks.length; i += concurrency) {
       const batch = tasks.slice(i, i + concurrency);
       const results = await Promise.allSettled(batch);
 
       for (const result of results) {
+        completed++;
         if (result.status === 'fulfilled' && result.value) {
           discovered.push(result.value);
           const device = result.value;
           console.log(`[SCAN FOUND] ${device.alias} (${device.ip}) on ${interfaceName}`);
         }
       }
+
+      // 显示进度（每批完成后）
+      const progress = Math.round((completed / total) * 100);
+      process.stdout.write(`\r[SCAN] ${interfaceName}: ${progress}% (${completed}/${total})`);
     }
+
+    // 换行，避免覆盖
+    console.log('');
 
     return discovered;
   }
@@ -600,7 +668,7 @@ class LocalSendDiscovery {
         port: this.httpPort,
         path: `/api/localsend/${API_VERSION}/info?fingerprint=${DEVICE_FINGERPRINT}`,
         method: 'GET',
-        timeout: 1000  // 1秒超时（快速失败）
+        timeout: 500  // 优化：从 1000ms 降低到 500ms（快速失败）
       };
 
       const req = http.request(options, (res) => {
@@ -793,6 +861,14 @@ class LocalSendDiscovery {
       console.log(`\nConfigured additional subnets:`);
       this.config.additionalSubnets.forEach((subnet, index) => {
         console.log(`  ${index + 1}. ${subnet}.0/24 - Priority: 30 [配置文件]`);
+      });
+    }
+
+    // 显示配置的已知设备
+    if (this.config.knownDevices && this.config.knownDevices.length > 0) {
+      console.log(`\nConfigured known devices (fast scan):`);
+      this.config.knownDevices.forEach((ip, index) => {
+        console.log(`  ${index + 1}. ${ip} ⚡`);
       });
     }
 

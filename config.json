@@ -2,5 +2,6 @@
   "additionalSubnets": [
     "192.168.1",
     "192.168.11"
-  ]
+  ],
+  "knownDevices": []
 }
