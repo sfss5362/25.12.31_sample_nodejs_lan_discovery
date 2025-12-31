@@ -23,7 +23,7 @@ const discoveredDevices = new Map();
 
 class LocalSendDiscovery {
   constructor() {
-    this.udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    this.udpSockets = [];  // 多个 socket（每个网络接口一个）
     this.httpServer = null;
     this.announceTimer = null;
     this.cleanupTimer = null;
@@ -159,42 +159,85 @@ class LocalSendDiscovery {
     }
   }
 
-  // 启动 UDP 多播发现
+  // 启动 UDP 多播发现（多网卡支持）
   startUDPDiscovery() {
     return new Promise((resolve, reject) => {
-      this.udpSocket.on('error', (err) => {
-        console.error(`UDP Socket error: ${err}`);
-        reject(err);
-      });
+      const interfaces = this.getAllLocalIPs();
 
-      this.udpSocket.on('message', (msg, rinfo) => {
-        this.handleUDPMessage(msg, rinfo);
-      });
+      if (interfaces.length === 0) {
+        console.warn('No network interfaces found, using fallback');
+        interfaces.push({ name: 'fallback', address: '0.0.0.0' });
+      }
 
-      this.udpSocket.on('listening', () => {
-        const address = this.udpSocket.address();
-        console.log(`\n=== LocalSend-like Discovery Started ===`);
-        console.log(`UDP listening on ${address.address}:${address.port}`);
-        console.log(`Multicast: ${MULTICAST_ADDR}`);
-        console.log(`Fingerprint: ${DEVICE_FINGERPRINT}`);
-        console.log(`Device: ${DEVICE_ALIAS}`);
-        console.log(`Local IP: ${this.getLocalIP()}`);
-        console.log(`=======================================\n`);
+      let successCount = 0;
+      let hasError = false;
 
-        // 加入多播组
+      // 为每个网络接口创建 socket
+      interfaces.forEach((iface, index) => {
         try {
-          this.udpSocket.addMembership(MULTICAST_ADDR);
-          this.udpSocket.setMulticastTTL(128);
-          this.udpSocket.setMulticastLoopback(true);
-        } catch (err) {
-          console.warn('Failed to setup multicast:', err.message);
-        }
+          const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
-        resolve();
+          socket.on('error', (err) => {
+            console.error(`UDP Socket error on ${iface.name} (${iface.address}): ${err.message}`);
+            if (!hasError) {
+              hasError = true;
+              reject(err);
+            }
+          });
+
+          socket.on('message', (msg, rinfo) => {
+            this.handleUDPMessage(msg, rinfo);
+          });
+
+          socket.on('listening', () => {
+            const address = socket.address();
+
+            if (successCount === 0) {
+              // 第一个 socket 启动时显示总体信息
+              console.log(`\n=== LocalSend-like Discovery Started ===`);
+              console.log(`Multicast: ${MULTICAST_ADDR}`);
+              console.log(`Fingerprint: ${DEVICE_FINGERPRINT}`);
+              console.log(`Device: ${DEVICE_ALIAS}`);
+            }
+
+            console.log(`UDP [${iface.name}] ${iface.address}:${address.port}`);
+
+            // 在当前接口上加入多播组
+            try {
+              socket.addMembership(MULTICAST_ADDR, iface.address);
+              socket.setMulticastTTL(128);
+              socket.setMulticastLoopback(true);
+            } catch (err) {
+              console.warn(`Failed to setup multicast on ${iface.name}: ${err.message}`);
+            }
+
+            successCount++;
+
+            // 所有接口都启动后 resolve
+            if (successCount === interfaces.length) {
+              console.log(`=======================================\n`);
+              resolve();
+            }
+          });
+
+          // 绑定端口
+          socket.bind(PORT);
+
+          // 保存 socket 及其接口信息
+          this.udpSockets.push({
+            interface: iface,
+            socket: socket
+          });
+
+        } catch (err) {
+          console.error(`Failed to create socket for ${iface.name}:`, err.message);
+        }
       });
 
-      // 绑定端口
-      this.udpSocket.bind(PORT);
+      // 如果没有任何 socket 创建成功
+      if (this.udpSockets.length === 0) {
+        reject(new Error('No UDP sockets could be created'));
+      }
     });
   }
 
@@ -285,23 +328,29 @@ class LocalSendDiscovery {
     const message = JSON.stringify(this.getDeviceInfo(false));
     const buffer = Buffer.from(message);
 
-    this.udpSocket.send(buffer, 0, buffer.length, PORT, MULTICAST_ADDR, (err) => {
-      if (err) {
-        console.error('UDP respond error:', err.message);
-      }
-    });
+    // 在所有网络接口上发送响应
+    for (const { interface: iface, socket } of this.udpSockets) {
+      socket.send(buffer, 0, buffer.length, PORT, MULTICAST_ADDR, (err) => {
+        if (err) {
+          console.error(`UDP respond error on ${iface.name}:`, err.message);
+        }
+      });
+    }
   }
 
-  // 通过 UDP 多播广播自己
+  // 通过 UDP 多播广播自己（所有网卡）
   announceViaUDP() {
     const message = JSON.stringify(this.getDeviceInfo(true));  // announcement=true
     const buffer = Buffer.from(message);
 
-    this.udpSocket.send(buffer, 0, buffer.length, PORT, MULTICAST_ADDR, (err) => {
-      if (err) {
-        console.error('UDP announce error:', err.message);
-      }
-    });
+    // 在所有网络接口上发送
+    for (const { interface: iface, socket } of this.udpSockets) {
+      socket.send(buffer, 0, buffer.length, PORT, MULTICAST_ADDR, (err) => {
+        if (err) {
+          console.error(`UDP announce error on ${iface.name}:`, err.message);
+        }
+      });
+    }
   }
 
   // 启动时发送 3 次公告序列（防止 UDP 丢包）
@@ -567,9 +616,21 @@ class LocalSendDiscovery {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
     }
-    if (this.udpSocket) {
-      this.udpSocket.close();
+    if (this.autoRefreshTimer) {
+      clearInterval(this.autoRefreshTimer);
     }
+
+    // 关闭所有 UDP socket
+    for (const { interface: iface, socket } of this.udpSockets) {
+      try {
+        socket.close();
+        console.log(`Closed UDP socket on ${iface.name}`);
+      } catch (err) {
+        console.error(`Error closing socket on ${iface.name}:`, err.message);
+      }
+    }
+    this.udpSockets = [];
+
     if (this.httpServer) {
       this.httpServer.close();
     }
