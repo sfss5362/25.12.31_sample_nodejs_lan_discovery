@@ -305,7 +305,9 @@ class LocalSendDiscovery {
               console.log(`Device: ${DEVICE_ALIAS}`);
             }
 
-            console.log(`UDP [${iface.name}] ${iface.address}:${address.port}`);
+            // 对齐显示：接口名固定 40 字符宽度
+            const ifaceName = iface.name.padEnd(40, ' ');
+            console.log(`UDP [${ifaceName}] ${iface.address}:${address.port}`);
 
             // 在当前接口上加入多播组
             try {
