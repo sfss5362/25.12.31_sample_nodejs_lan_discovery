@@ -1,0 +1,29 @@
+{
+  "name": "lan-discovery",
+  "version": "1.0.0",
+  "description": "LocalSend-like LAN device discovery demo",
+  "main": "index.js",
+  "bin": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "pkg . --targets node18-win-x64 --output dist/lan-discovery.exe"
+  },
+  "keywords": [
+    "udp",
+    "multicast",
+    "discovery",
+    "lan"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist",
+    "scripts": []
+  }
+}
