@@ -790,35 +790,35 @@ class LocalSendDiscovery {
     this.showMenu();
   }
 
-  // 开始自动刷新设备列表
+  // 开始自动刷新设备列表（优化：UDP + HTTP 并行）
   startAutoRefresh() {
     // 停止之前的自动刷新
     this.stopAutoRefresh();
 
     console.log('\n>>> Auto-refresh mode started <<<');
+    console.log('UDP multicast + HTTP scan running in parallel for fastest discovery');
     console.log('Press any key to stop and return to menu\n');
 
     let refreshCount = 0;
-    let hasScanned = false;
 
     // 立即广播并显示一次
     this.announceViaUDP();
     setTimeout(() => this.showDeviceListOnce(), 500);
 
-    // 每3秒自动刷新
+    // 优化：立即启动 HTTP 扫描（不等待 UDP），并行运行
+    setTimeout(async () => {
+      console.log('[FAST MODE] Starting parallel HTTP scan (not waiting for UDP)...\n');
+      await this.scanSubnet();
+      this.showDeviceListOnce();
+    }, 2000);  // 2 秒后启动（给 UDP 一点时间，但不等待）
+
+    // 每3秒自动刷新（持续 UDP 多播）
     this.autoRefreshTimer = setInterval(async () => {
       refreshCount++;
       this.announceViaUDP();
 
       // 等待 UDP 响应
       await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // 优化：如果 6 秒后仍未发现设备，自动触发 HTTP 扫描（更快）
-      if (refreshCount >= 2 && discoveredDevices.size === 0 && !hasScanned) {
-        hasScanned = true;
-        console.log('\n[AUTO] No devices found via multicast (6s), starting HTTP scan...\n');
-        await this.scanSubnet();
-      }
 
       this.showDeviceListOnce();
     }, 3000);
