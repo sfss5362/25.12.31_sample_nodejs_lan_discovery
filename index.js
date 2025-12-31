@@ -5,6 +5,8 @@ const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
 
 // 配置 - 使用 LocalSend 的标准配置
 const MULTICAST_ADDR = '224.0.0.167';  // LocalSend 标准多播地址
@@ -29,6 +31,23 @@ class LocalSendDiscovery {
     this.cleanupTimer = null;
     this.httpPort = PORT;
     this.autoRefreshTimer = null;  // 自动刷新定时器
+    this.config = this.loadConfig();  // 加载配置文件
+  }
+
+  // 加载配置文件
+  loadConfig() {
+    try {
+      const configPath = path.join(__dirname, 'config.json');
+      if (fs.existsSync(configPath)) {
+        const configData = fs.readFileSync(configPath, 'utf8');
+        const config = JSON.parse(configData);
+        console.log(`Loaded config: ${config.additionalSubnets?.length || 0} additional subnet(s)`);
+        return config;
+      }
+    } catch (err) {
+      console.warn('Failed to load config.json:', err.message);
+    }
+    return { additionalSubnets: [] };
   }
 
   // 计算网络接口优先级（参考 LocalSend）
@@ -418,47 +437,91 @@ class LocalSendDiscovery {
     }
   }
 
-  // HTTP 子网扫描（AP 隔离网络备用方案）- 多子网支持 + 智能过滤
-  async scanSubnet() {
+  // 获取所有要扫描的子网（本地接口 + 配置文件）
+  getAllSubnetsToScan() {
+    const subnets = [];
+    const subnetSet = new Set();  // 用于去重
+
+    // 1. 添加本地网络接口的子网
     const localIPs = this.getAllLocalIPs();
-    if (localIPs.length === 0) {
-      console.log('[SCAN] No network interface found');
+    for (const iface of localIPs) {
+      const subnet = iface.address.split('.').slice(0, 3).join('.');
+      if (!subnetSet.has(subnet)) {
+        subnetSet.add(subnet);
+        subnets.push({
+          subnet: subnet,
+          name: iface.name,
+          ip: iface.address,
+          priority: iface.priority,
+          source: 'local'
+        });
+      }
+    }
+
+    // 2. 添加配置文件中的额外子网
+    if (this.config.additionalSubnets && this.config.additionalSubnets.length > 0) {
+      for (const subnet of this.config.additionalSubnets) {
+        if (!subnetSet.has(subnet)) {
+          subnetSet.add(subnet);
+          subnets.push({
+            subnet: subnet,
+            name: `Configured: ${subnet}.0/24`,
+            ip: null,  // 配置的子网没有本地 IP
+            priority: 30,  // 配置子网优先级：介于 WiFi(100) 和普通(10) 之间
+            source: 'config'
+          });
+        }
+      }
+    }
+
+    // 3. 按优先级降序排序
+    subnets.sort((a, b) => b.priority - a.priority);
+
+    return subnets;
+  }
+
+  // HTTP 子网扫描（AP 隔离网络备用方案）- 多子网支持 + 智能过滤 + 配置文件
+  async scanSubnet() {
+    const allSubnets = this.getAllSubnetsToScan();
+
+    if (allSubnets.length === 0) {
+      console.log('[SCAN] No network interface or configured subnet found');
       return [];
     }
 
-    // 过滤掉负优先级的接口（虚拟网卡、APIPA、VPN）
-    const validIPs = localIPs.filter(ip => ip.priority > 0);
+    // 过滤掉负优先级的子网（虚拟网卡、APIPA、VPN）
+    const validSubnets = allSubnets.filter(subnet => subnet.priority > 0);
 
-    if (validIPs.length === 0) {
-      console.log('[SCAN] No valid network interface (all are virtual/APIPA/VPN)');
-      console.log('[SCAN] Skipped interfaces:');
-      localIPs.forEach(ip => {
-        console.log(`  - ${ip.name} (${ip.address}) [Priority: ${ip.priority}]`);
+    if (validSubnets.length === 0) {
+      console.log('[SCAN] No valid subnet (all are virtual/APIPA/VPN)');
+      console.log('[SCAN] Skipped subnets:');
+      allSubnets.forEach(subnet => {
+        console.log(`  - ${subnet.name} (${subnet.subnet}.x) [Priority: ${subnet.priority}]`);
       });
       return [];
     }
 
-    // 限制最多扫描 3 个接口（对齐 LocalSend）
-    const MAX_INTERFACES = 3;
-    const interfacesToScan = validIPs.slice(0, MAX_INTERFACES);
+    // 限制最多扫描 3 个子网（对齐 LocalSend）
+    const MAX_SUBNETS = 3;
+    const subnetsToScan = validSubnets.slice(0, MAX_SUBNETS);
 
-    console.log(`\n[SCAN] Starting multi-subnet scan (${interfacesToScan.length} subnet${interfacesToScan.length > 1 ? 's' : ''})`);
-    console.log('[SCAN] Selected interfaces (by priority):');
-    interfacesToScan.forEach((iface, index) => {
-      console.log(`  ${index + 1}. ${iface.name} (${iface.address}) [Priority: ${iface.priority}]`);
+    console.log(`\n[SCAN] Starting multi-subnet scan (${subnetsToScan.length} subnet${subnetsToScan.length > 1 ? 's' : ''})`);
+    console.log('[SCAN] Selected subnets (by priority):');
+    subnetsToScan.forEach((subnet, index) => {
+      const sourceLabel = subnet.source === 'config' ? '[配置文件]' : '[本地网卡]';
+      console.log(`  ${index + 1}. ${subnet.name} (${subnet.subnet}.x) [Priority: ${subnet.priority}] ${sourceLabel}`);
     });
 
-    if (validIPs.length > MAX_INTERFACES) {
-      console.log(`[SCAN] Skipped ${validIPs.length - MAX_INTERFACES} lower-priority interface(s)`);
+    if (validSubnets.length > MAX_SUBNETS) {
+      console.log(`[SCAN] Skipped ${validSubnets.length - MAX_SUBNETS} lower-priority subnet(s)`);
     }
 
     console.log('[SCAN] This may take 10-30 seconds per subnet...\n');
 
     // 并行扫描所有子网
-    const allPromises = interfacesToScan.map((iface, index) => {
-      const subnet = iface.address.split('.').slice(0, 3).join('.');
-      console.log(`[SCAN ${index + 1}/${interfacesToScan.length}] ${iface.name}: ${subnet}.1-254`);
-      return this.scanSingleSubnet(subnet, iface.address, iface.name);
+    const allPromises = subnetsToScan.map((subnetInfo, index) => {
+      console.log(`[SCAN ${index + 1}/${subnetsToScan.length}] ${subnetInfo.name}: ${subnetInfo.subnet}.1-254`);
+      return this.scanSingleSubnet(subnetInfo.subnet, subnetInfo.ip, subnetInfo.name);
     });
 
     // 等待所有扫描完成
@@ -467,7 +530,7 @@ class LocalSendDiscovery {
     // 合并所有结果
     const allDevices = results.flat();
 
-    console.log(`\n[SCAN] Complete. Found ${allDevices.length} device(s) across ${interfacesToScan.length} subnet(s)\n`);
+    console.log(`\n[SCAN] Complete. Found ${allDevices.length} device(s) across ${subnetsToScan.length} subnet(s)\n`);
     return allDevices;
   }
 
@@ -697,19 +760,30 @@ class LocalSendDiscovery {
       console.log(`  ${index + 1}. ${ip.address} (${ip.name}) - ${priorityLabel}`);
     });
 
-    // 显示将被扫描的接口
-    const validIPs = ips.filter(ip => ip.priority > 0);
-    if (validIPs.length > 0) {
-      const scanIPs = validIPs.slice(0, 3);
-      console.log(`\nInterfaces to be scanned (top 3):`);
-      scanIPs.forEach((ip, index) => {
-        console.log(`  ${index + 1}. ${ip.name} (${ip.address})`);
+    // 显示配置的额外子网
+    if (this.config.additionalSubnets && this.config.additionalSubnets.length > 0) {
+      console.log(`\nConfigured additional subnets:`);
+      this.config.additionalSubnets.forEach((subnet, index) => {
+        console.log(`  ${index + 1}. ${subnet}.0/24 - Priority: 30 [配置文件]`);
+      });
+    }
+
+    // 显示将被扫描的子网
+    const allSubnets = this.getAllSubnetsToScan();
+    const validSubnets = allSubnets.filter(s => s.priority > 0);
+    if (validSubnets.length > 0) {
+      const scanSubnets = validSubnets.slice(0, 3);
+      console.log(`\nSubnets to be scanned (top 3):`);
+      scanSubnets.forEach((subnet, index) => {
+        const sourceLabel = subnet.source === 'config' ? '[配置文件]' : '[本地网卡]';
+        console.log(`  ${index + 1}. ${subnet.subnet}.0/24 (${subnet.name}) ${sourceLabel}`);
       });
     }
 
     console.log(`\nAPI: http://localhost:${this.httpPort}/api/localsend/v2/info`);
     console.log('');
     console.log('Note: Virtual networks, APIPA, and VPN are filtered out from scanning.');
+    console.log('      Additional subnets can be configured in config.json');
     console.log('-------------------\n');
     this.showMenu();
   }
